@@ -9,7 +9,8 @@ metadata:
 spec:
   secretsName: my-cluster-secrets
   vaultSecretName: keyring-secret-vault
-  sslSecretName: my-cluster-ssl
+#  usersSecrets:
+#  - "secret-for-users"
   sslInternalSecretName: my-cluster-ssl-internal
   allowUnsafeConfigurations: false
 #  pause: false

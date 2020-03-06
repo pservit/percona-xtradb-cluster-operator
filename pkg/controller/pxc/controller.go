@@ -258,6 +258,11 @@ func (r *ReconcilePerconaXtraDBCluster) Reconcile(request reconcile.Request) (re
 		return reconcile.Result{}, err
 	}
 
+	err = r.reconcileUsers(o)
+	if err != nil {
+		return rr, errors.Wrap(err, "reconcileUsers")
+	}
+
 	return rr, nil
 }
 
