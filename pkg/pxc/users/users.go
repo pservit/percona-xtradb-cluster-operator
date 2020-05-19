@@ -9,30 +9,13 @@ import (
 )
 
 type Manager struct {
-	db            *sql.DB
-	Users         []SysUser
-	InternalUsers []InternalUser
-}
-
-type UsersSecret struct {
-	StringData map[string]string `yaml:"stringData"`
-}
-
-type Data struct {
-	Users []SysUser `yaml:"users"`
+	db *sql.DB
 }
 
 type SysUser struct {
 	Name  string   `yaml:"username"`
 	Pass  string   `yaml:"password"`
 	Hosts []string `yaml:"hosts"`
-}
-
-type InternalUser struct {
-	Name     string `json:"name"`
-	LastPass string `json:"lastPass"`
-	Host     string `yaml:"host"`
-	Time     int64  `json:"time"`
 }
 
 func NewManager(hosts []string, rootPass string) (Manager, error) {
