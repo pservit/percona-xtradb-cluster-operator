@@ -1,17 +1,15 @@
 package pxc
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	api "github.com/percona/percona-xtradb-cluster-operator/pkg/apis/pxc/v1"
 	"github.com/percona/percona-xtradb-cluster-operator/pkg/pxc/users"
 	"github.com/pkg/errors"
-	"gopkg.in/yaml.v2"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,77 +28,15 @@ func (r *ReconcilePerconaXtraDBCluster) reconcileUsers(cr *api.PerconaXtraDBClus
 		return nil
 	}
 
-	if len(cr.Spec.Users.Secrets) == 0 {
-		return nil
-	}
-
-	for _, secretName := range cr.Spec.Users.Secrets {
-		err := r.handleAppUsersSecret(secretName, cr)
-		if err != nil {
-			log.Error(err, "handle users secret "+secretName)
-		}
-	}
-
-	return nil
-}
-
-func (r *ReconcilePerconaXtraDBCluster) handleAppUsersSecret(secretName string, cr *api.PerconaXtraDBCluster) error {
-	appUsersSecretObj := corev1.Secret{}
-	err := r.client.Get(context.TODO(),
-		types.NamespacedName{
-			Namespace: cr.Namespace,
-			Name:      secretName,
-		},
-		&appUsersSecretObj,
-	)
-	if err != nil && k8serrors.IsNotFound(err) {
-		return nil
-	} else if err != nil {
-		return errors.Wrapf(err, "get app users secret '%s'", secretName)
-	}
-
-	newSecretDataHash := ""
-
-	dataChanged, err := appUsersSecretDataChanged(&newSecretDataHash, &appUsersSecretObj)
+	err := r.handleSysUsersSecret(cr)
 	if err != nil {
-		return errors.Wrap(err, "check app users data changes")
-	}
-
-	if !dataChanged {
-		if appUsersSecretObj.Annotations["status"] == statusSucceeded || appUsersSecretObj.Annotations["status"] == statusFailed {
-			return nil
-		}
-	}
-
-	if len(appUsersSecretObj.Annotations) == 0 {
-		appUsersSecretObj.Annotations = make(map[string]string)
-	}
-
-	if dataChanged {
-		err = r.manageAppUsers(cr, &appUsersSecretObj)
-		if err != nil {
-			return errors.Wrap(err, "manage client users")
-		}
-
-		appUsersSecretObj.Annotations["last-applied"] = newSecretDataHash
-		appUsersSecretObj.Annotations["status"] = statusSucceeded
-
-		err = r.updateInternalAppUsersSecret(cr, &appUsersSecretObj)
-		if err != nil {
-			return errors.Wrap(err, "update internal app users secret")
-		}
-
-		err = r.client.Update(context.TODO(), &appUsersSecretObj)
-		if err != nil {
-			return errors.Wrap(err, "update app users secret status")
-		}
-		return nil
+		log.Error(err, "handle system users secret ")
 	}
 
 	return nil
 }
 
-func (r *ReconcilePerconaXtraDBCluster) manageAppUsers(cr *api.PerconaXtraDBCluster, appUsersSecretObj *corev1.Secret) error {
+func (r *ReconcilePerconaXtraDBCluster) handleSysUsersSecret(cr *api.PerconaXtraDBCluster) error {
 	sysUsersSecretObj := corev1.Secret{}
 	err := r.client.Get(context.TODO(),
 		types.NamespacedName{
@@ -109,101 +45,197 @@ func (r *ReconcilePerconaXtraDBCluster) manageAppUsers(cr *api.PerconaXtraDBClus
 		},
 		&sysUsersSecretObj,
 	)
-	if err != nil {
-		return errors.Wrap(err, "get sys users secret")
+	if err != nil && k8serrors.IsNotFound(err) {
+		return nil
+	} else if err != nil {
+		return errors.Wrapf(err, "get app users secret '%s'", cr.Spec.SecretsName)
 	}
 
-	um, err := users.NewManager([]string{cr.Name + "-pxc"}, string(sysUsersSecretObj.Data["root"]))
+	newSysData, err := json.Marshal(sysUsersSecretObj.Data)
 	if err != nil {
-		appUsersSecretObj.Annotations["status"] = statusFailed
-		errU := r.client.Update(context.TODO(), appUsersSecretObj)
-		if errU != nil {
-			return errors.Wrap(errU, "update secret status")
-		}
-		return errors.Wrap(err, "new users manager")
+		return errors.Wrap(err, "marshal sys secret data")
+	}
+	newSecretDataHash := sha256Hash(newSysData)
+
+	internalSysSecretObj, err := r.getInternalSysUsersSecret(cr, &sysUsersSecretObj)
+	if err != nil {
+		return errors.Wrap(err, "get internal secret")
+	}
+	dataChanged, err := sysUsersSecretDataChanged(newSecretDataHash, &internalSysSecretObj)
+	if err != nil {
+		return errors.Wrap(err, "check app users data changes")
 	}
 
-	internalAppSecretObj, err := r.getInternalAppUsersSecret(cr, appUsersSecretObj)
-	if err != nil {
-		return errors.Wrap(err, "internal secret")
+	if !dataChanged {
+		return nil
 	}
 
-	err = um.GetUsersData(*appUsersSecretObj, internalAppSecretObj)
+	//if len(sysUsersSecretObj.Annotations) == 0 {
+	//	sysUsersSecretObj.Annotations = make(map[string]string)
+	//}
+	var restartPXC bool
+	var restartProxy bool
+	err = r.manageSysUsers(cr, &sysUsersSecretObj, &internalSysSecretObj, newSecretDataHash, &restartPXC, &restartProxy)
 	if err != nil {
-		appUsersSecretObj.Annotations["status"] = statusFailed
-		errU := r.client.Update(context.TODO(), appUsersSecretObj)
-		if errU != nil {
-			return errors.Wrap(errU, "update secret status")
-		}
-		return errors.Wrap(err, "get users data")
+		return errors.Wrap(err, "manage client users")
 	}
 
-	err = um.ManageUsers(appUsersSecretObj.Name)
+	//sysUsersSecretObj.Annotations["last-applied"] = newSecretDataHash
+	//sysUsersSecretObj.Annotations["status"] = statusSucceeded
+
+	err = r.updateInternalSysUsersSecret(cr, &sysUsersSecretObj)
 	if err != nil {
-		appUsersSecretObj.Annotations["status"] = statusFailed
-		errU := r.client.Update(context.TODO(), appUsersSecretObj)
-		if errU != nil {
-			return errors.Wrap(errU, "update secret status")
-		}
-		return errors.Wrap(err, "manage users")
+		return errors.Wrap(err, "update internal app users secret")
 	}
 
-	// sync users if ProxySql enabled
-	if cr.Spec.ProxySQL != nil && cr.Spec.ProxySQL.Size > 0 {
-		pod := corev1.Pod{}
-		err = r.client.Get(context.TODO(),
-			types.NamespacedName{
-				Namespace: cr.Namespace,
-				Name:      cr.Name + "-proxysql-0",
-			},
-			&pod,
-		)
+	//err = r.client.Update(context.TODO(), &sysUsersSecretObj)
+	//if err != nil {
+	//	return errors.Wrap(err, "update app users secret status")
+	//}
+
+	if restartProxy && cr.Spec.ProxySQL != nil && cr.Spec.ProxySQL.Size > 0 {
+		err = r.restartProxy(cr, newSecretDataHash)
 		if err != nil {
-			return errors.Wrap(err, "get proxy pod")
+			return errors.Wrap(err, "restart proxy")
 		}
-		var errb, outb bytes.Buffer
-		err = r.clientcmd.Exec(&pod, "proxysql", []string{"proxysql-admin", "--syncusers"}, nil, &outb, &errb, false)
+	}
+
+	if restartPXC {
+		err = r.restartPXC(cr, newSecretDataHash, &sysUsersSecretObj)
 		if err != nil {
-			return errors.Errorf("exec syncusers: %v / %s / %s", err, outb.String(), errb.String())
-		}
-		if len(errb.Bytes()) > 0 {
-			return errors.New("syncusers: " + errb.String())
+			return errors.Wrap(err, "restart pxc")
 		}
 	}
 
 	return nil
 }
 
-// getInternalAppUsersSecret return secret created by operator for storing app users data and statuses
-func (r *ReconcilePerconaXtraDBCluster) getInternalAppUsersSecret(cr *api.PerconaXtraDBCluster, appUsersSecretObj *corev1.Secret) (corev1.Secret, error) {
+func (r *ReconcilePerconaXtraDBCluster) manageSysUsers(cr *api.PerconaXtraDBCluster, sysUsersSecretObj, internalSysSecretObj *corev1.Secret, newSecretDataHash string, restartPXC, restartProxy *bool) error {
+	um, err := users.NewManager([]string{cr.Name + "-pxc"}, string(internalSysSecretObj.Data["root"]))
+	if err != nil {
+		return errors.Wrap(err, "new users manager")
+	}
+	var sysUsers []users.SysUser
+
+	for name, pass := range sysUsersSecretObj.Data {
+		hosts := []string{}
+
+		if string(sysUsersSecretObj.Data[name]) == string(internalSysSecretObj.Data[name]) {
+			continue
+		}
+		switch name {
+		case "root":
+			*restartProxy = true
+			hosts = []string{"localhost", "%"}
+		case "xtrabackup":
+			*restartProxy = true
+			hosts = []string{"localhost"}
+		case "monitor":
+			if cr.Spec.PMM.Enabled {
+				*restartPXC = true
+				hosts = []string{"10.%", "%"}
+			}
+		case "clustercheck":
+			*restartProxy = true
+			*restartPXC = true
+			hosts = []string{"localhost"}
+		case "proxyadmin":
+			*restartProxy = true
+			continue
+
+		case "pmmserver":
+			*restartPXC = true
+			continue
+		}
+		user := users.SysUser{
+			Name:  name,
+			Pass:  string(pass),
+			Hosts: hosts,
+		}
+		sysUsers = append(sysUsers, user)
+	}
+	if len(sysUsers) > 0 {
+		err = um.UpdateUsersPass(sysUsers)
+		if err != nil {
+			return errors.Wrap(err, "manage users")
+		}
+	}
+
+	return nil
+}
+
+func (r *ReconcilePerconaXtraDBCluster) restartPXC(cr *api.PerconaXtraDBCluster, newSecretDataHash string, sysUsersSecretObj *corev1.Secret) error {
+	sfsPXC := appsv1.StatefulSet{}
+	err := r.client.Get(context.TODO(),
+		types.NamespacedName{
+			Namespace: cr.Namespace,
+			Name:      cr.Name + "-pxc",
+		},
+		&sfsPXC,
+	)
+	if len(sfsPXC.Annotations) == 0 {
+		sfsPXC.Annotations = make(map[string]string)
+	}
+	sfsPXC.Spec.Template.Annotations["last-applied-secret"] = newSecretDataHash
+	err = r.client.Update(context.TODO(), &sfsPXC)
+	if err != nil {
+		return errors.Wrap(err, "update pxc sfs last-applied annotation")
+	}
+
+	return nil
+}
+
+func (r *ReconcilePerconaXtraDBCluster) restartProxy(cr *api.PerconaXtraDBCluster, newSecretDataHash string) error {
+	sfsProxy := appsv1.StatefulSet{}
+	err := r.client.Get(context.TODO(),
+		types.NamespacedName{
+			Namespace: cr.Namespace,
+			Name:      cr.Name + "-proxysql",
+		},
+		&sfsProxy,
+	)
+	if len(sfsProxy.Annotations) == 0 {
+		sfsProxy.Annotations = make(map[string]string)
+	}
+	sfsProxy.Spec.Template.Annotations["last-applied-secret"] = newSecretDataHash
+	err = r.client.Update(context.TODO(), &sfsProxy)
+	if err != nil {
+		return errors.Wrap(err, "update pxc sfs last-applied annotation")
+	}
+
+	return nil
+}
+
+// getInternalSysUsersSecret return secret created by operator for storing system users data
+func (r *ReconcilePerconaXtraDBCluster) getInternalSysUsersSecret(cr *api.PerconaXtraDBCluster, sysUsersSecretObj *corev1.Secret) (corev1.Secret, error) {
 	secretName := internalPrefix + cr.Spec.SecretsName
-	internalAppUsersSecretObj := corev1.Secret{}
+	internalSysUsersSecretObj := corev1.Secret{}
 	err := r.client.Get(context.TODO(),
 		types.NamespacedName{
 			Namespace: cr.Namespace,
 			Name:      secretName,
 		},
-		&internalAppUsersSecretObj,
+		&internalSysUsersSecretObj,
 	)
 	if err != nil && !k8serrors.IsNotFound(err) {
-		return internalAppUsersSecretObj, errors.Wrap(err, "get internal users secret")
+		return internalSysUsersSecretObj, errors.Wrap(err, "get internal users secret")
 	} else if k8serrors.IsNotFound(err) {
-		internalAppUsersSecretObj, err = r.handleInternalAppUsersSecretObj(cr, appUsersSecretObj, false)
+		internalSysUsersSecretObj, err = r.getInternalSysUsersSecretObj(cr, sysUsersSecretObj, false)
 		if err != nil {
-			return internalAppUsersSecretObj, errors.Wrap(err, "handle internal secret")
+			return internalSysUsersSecretObj, errors.Wrap(err, "handle internal secret")
 		}
 
-		err = r.client.Create(context.TODO(), &internalAppUsersSecretObj)
+		err = r.client.Create(context.TODO(), &internalSysUsersSecretObj)
 		if err != nil {
-			return internalAppUsersSecretObj, errors.Wrap(err, "create internal users secret")
+			return internalSysUsersSecretObj, errors.Wrap(err, "create internal users secret")
 		}
 	}
 
-	return internalAppUsersSecretObj, nil
+	return internalSysUsersSecretObj, nil
 }
 
-func (r *ReconcilePerconaXtraDBCluster) updateInternalAppUsersSecret(cr *api.PerconaXtraDBCluster, appUsersSecretObj *corev1.Secret) error {
-	internalAppUsersSecretObj, err := r.handleInternalAppUsersSecretObj(cr, appUsersSecretObj, true)
+func (r *ReconcilePerconaXtraDBCluster) updateInternalSysUsersSecret(cr *api.PerconaXtraDBCluster, sysUsersSecretObj *corev1.Secret) error {
+	internalAppUsersSecretObj, err := r.getInternalSysUsersSecretObj(cr, sysUsersSecretObj, true)
 	if err != nil {
 		return errors.Wrap(err, "update internal secret")
 	}
@@ -215,93 +247,29 @@ func (r *ReconcilePerconaXtraDBCluster) updateInternalAppUsersSecret(cr *api.Per
 
 }
 
-func appUsersSecretDataChanged(newHash *string, usersSecret *corev1.Secret) (bool, error) {
+func (r *ReconcilePerconaXtraDBCluster) getInternalSysUsersSecretObj(cr *api.PerconaXtraDBCluster, sysUsersSecretObj *corev1.Secret, updateIntUsersList bool) (corev1.Secret, error) {
+	return corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      internalPrefix + cr.Spec.SecretsName,
+			Namespace: cr.Namespace,
+		},
+		Data: sysUsersSecretObj.Data,
+		Type: corev1.SecretTypeOpaque,
+	}, nil
+}
+
+func sysUsersSecretDataChanged(newHash string, usersSecret *corev1.Secret) (bool, error) {
 	secretData, err := json.Marshal(usersSecret.Data)
 	if err != nil {
 		return true, err
 	}
-	hash := sha256Hash(secretData)
-	*newHash = hash
-	lastAppliedHash := ""
-	if oldHash, ok := usersSecret.Annotations["last-applied"]; ok {
-		lastAppliedHash = oldHash
-	}
-	if lastAppliedHash != hash {
+	oldHash := sha256Hash(secretData)
+
+	if oldHash != newHash {
 		return true, nil
 	}
 
 	return false, nil
-}
-
-func (r *ReconcilePerconaXtraDBCluster) handleInternalAppUsersSecretObj(cr *api.PerconaXtraDBCluster, appUsersSecretObj *corev1.Secret, updateIntUsersList bool) (corev1.Secret, error) {
-	interUsers := []users.InternalUser{}
-	interUsersSecretObj := corev1.Secret{}
-	intSecretName := internalPrefix + cr.Spec.SecretsName
-
-	if updateIntUsersList { //here we are getting list of users that already stored in internal secret, and not belong to current owner
-		err := r.client.Get(context.TODO(),
-			types.NamespacedName{
-				Namespace: cr.Namespace,
-				Name:      intSecretName,
-			},
-			&interUsersSecretObj,
-		)
-		if err != nil {
-			return interUsersSecretObj, errors.Wrap(err, "get internal users secret")
-		}
-		err = json.Unmarshal(interUsersSecretObj.Data["users"], &interUsers)
-		if err != nil {
-			return interUsersSecretObj, errors.Wrap(err, "unmarshal users secret data")
-		}
-		var newInterUsers []users.InternalUser
-		for _, u := range interUsers {
-			if u.Owner == appUsersSecretObj.Name {
-				continue // we drop this user because we are going to update only current owner users list
-			}
-			newInterUsers = append(newInterUsers, u)
-		}
-		interUsers = newInterUsers
-	}
-
-	var usersSlice users.Data
-	usersData := appUsersSecretObj.Data["grants.yaml"]
-	err := yaml.Unmarshal(usersData, &usersSlice)
-	if err != nil {
-		return interUsersSecretObj, errors.Wrap(err, "unmarshal users secret data")
-	}
-
-	for _, user := range usersSlice.Users {
-		for _, host := range user.Hosts {
-			var interUser users.InternalUser
-			interUser.Name = user.Name + "@" + host
-			interUser.Owner = appUsersSecretObj.Name
-			if updateIntUsersList {
-				interUser.Status = "applied"
-			} else {
-				interUser.Status = "applying"
-			}
-			interUser.Time = time.Now().Unix()
-
-			interUsers = append(interUsers, interUser)
-		}
-	}
-
-	interUsersData, err := json.Marshal(interUsers)
-	if err != nil {
-		return interUsersSecretObj, errors.Wrap(err, "marshal internal users")
-	}
-
-	data := make(map[string][]byte)
-	data["users"] = interUsersData
-
-	return corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      intSecretName,
-			Namespace: cr.Namespace,
-		},
-		Data: data,
-		Type: corev1.SecretTypeOpaque,
-	}, nil
 }
 
 func sha256Hash(data []byte) string {
