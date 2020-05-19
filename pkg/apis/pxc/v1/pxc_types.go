@@ -20,8 +20,6 @@ type PerconaXtraDBClusterSpec struct {
 	Pause                 bool                                 `json:"pause,omitempty"`
 	SecretsName           string                               `json:"secretsName,omitempty"`
 	VaultSecretName       string                               `json:"vaultSecretName,omitempty"`
-	UsersSecrets          []string                             `json:"usersSecrets,omitempty"`
-	Users                 UsersSpec                            `json:"users,omitempty"`
 	SSLSecretName         string                               `json:"sslSecretName,omitempty"`
 	SSLInternalSecretName string                               `json:"sslInternalSecretName,omitempty"`
 	PXC                   *PodSpec                             `json:"pxc,omitempty"`
@@ -212,10 +210,6 @@ type BackupStorageS3Spec struct {
 	CredentialsSecret string `json:"credentialsSecret"`
 	Region            string `json:"region,omitempty"`
 	EndpointURL       string `json:"endpointUrl,omitempty"`
-}
-
-type UsersSpec struct {
-	Secrets []string `json:"secrets,omitempty"`
 }
 
 type VolumeSpec struct {
